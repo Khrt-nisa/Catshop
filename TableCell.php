@@ -4,140 +4,158 @@
  * @link    https://github.com/dompdf/dompdf
  * @license http://www.gnu.org/copyleft/lesser.html GNU Lesser General Public License
  */
-namespace Dompdf\FrameDecorator;
+namespace Dompdf\FrameReflower;
 
-use Dompdf\Dompdf;
-use Dompdf\Frame;
 use Dompdf\FrameDecorator\Block as BlockFrameDecorator;
+use Dompdf\FrameDecorator\Table as TableFrameDecorator;
+use Dompdf\Helpers;
 
 /**
- * Decorates table cells for layout
+ * Reflows table cells
  *
  * @package dompdf
  */
-class TableCell extends BlockFrameDecorator
+class TableCell extends Block
 {
-
-    protected $_resolved_borders;
-    protected $_content_height;
-
-    //........................................................................
-
     /**
      * TableCell constructor.
-     * @param Frame $frame
-     * @param Dompdf $dompdf
+     * @param BlockFrameDecorator $frame
      */
-    function __construct(Frame $frame, Dompdf $dompdf)
+    function __construct(BlockFrameDecorator $frame)
     {
-        parent::__construct($frame, $dompdf);
-        $this->_resolved_borders = [];
-        $this->_content_height = 0;
-    }
-
-    //........................................................................
-
-    function reset()
-    {
-        parent::reset();
-        $this->_resolved_borders = [];
-        $this->_content_height = 0;
-        $this->_frame->reset();
+        parent::__construct($frame);
     }
 
     /**
-     * @return int
+     * @param BlockFrameDecorator|null $block
      */
-    function get_content_height()
+    function reflow(BlockFrameDecorator $block = null)
     {
-        return $this->_content_height;
-    }
+        // Counters and generated content
+        $this->_set_content();
 
-    /**
-     * @param $height
-     */
-    function set_content_height($height)
-    {
-        $this->_content_height = $height;
-    }
+        $style = $this->_frame->get_style();
 
-    /**
-     * @param $height
-     */
-    function set_cell_height($height)
-    {
-        $style = $this->get_style();
-        $v_space = (float)$style->length_in_pt(
-            [
-                $style->margin_top,
+        $table = TableFrameDecorator::find_parent_table($this->_frame);
+        $cellmap = $table->get_cellmap();
+
+        list($x, $y) = $cellmap->get_frame_position($this->_frame);
+        $this->_frame->set_position($x, $y);
+
+        $cells = $cellmap->get_spanned_cells($this->_frame);
+
+        $w = 0;
+        foreach ($cells["columns"] as $i) {
+            $col = $cellmap->get_column($i);
+            $w += $col["used-width"];
+        }
+
+        //FIXME?
+        $h = $this->_frame->get_containing_block("h");
+
+        $left_space = (float)$style->length_in_pt([$style->margin_left,
+                $style->padding_left,
+                $style->border_left_width],
+            $w);
+
+        $right_space = (float)$style->length_in_pt([$style->padding_right,
+                $style->margin_right,
+                $style->border_right_width],
+            $w);
+
+        $top_space = (float)$style->length_in_pt([$style->margin_top,
                 $style->padding_top,
-                $style->border_top_width,
-                $style->border_bottom_width,
+                $style->border_top_width],
+            $h);
+        $bottom_space = (float)$style->length_in_pt([$style->margin_bottom,
                 $style->padding_bottom,
-                $style->margin_bottom
-            ],
-            (float)$style->length_in_pt($style->height)
-        );
+                $style->border_bottom_width],
+            $h);
 
-        $new_height = $height - $v_space;
-        $style->set_used("height", $new_height);
+        $cb_w = $w - $left_space - $right_space;
+        $style->set_used("width", $cb_w);
 
-        if ($new_height > $this->_content_height) {
-            $y_offset = 0;
+        $content_x = $x + $left_space;
+        $content_y = $line_y = $y + $top_space;
 
-            // Adjust our vertical alignment
-            switch ($style->vertical_align) {
-                default:
-                case "baseline":
-                    // FIXME: this isn't right
+        // Adjust the first line based on the text-indent property
+        $indent = (float)$style->length_in_pt($style->text_indent, $w);
+        $this->_frame->increase_line_width($indent);
 
-                case "top":
-                    // Don't need to do anything
-                    return;
+        $page = $this->_frame->get_root();
 
-                case "middle":
-                    $y_offset = ($new_height - $this->_content_height) / 2;
-                    break;
+        // Set the y position of the first line in the cell
+        $line_box = $this->_frame->get_current_line_box();
+        $line_box->y = $line_y;
 
-                case "bottom":
-                    $y_offset = $new_height - $this->_content_height;
-                    break;
+        // Set the containing blocks and reflow each child
+        foreach ($this->_frame->get_children() as $child) {
+            $child->set_containing_block($content_x, $content_y, $cb_w, $h);
+            $this->process_clear($child);
+            $child->reflow($this->_frame);
+            $this->process_float($child, $content_x, $cb_w);
+
+            if ($page->is_full()) {
+                break;
             }
+        }
 
-            if ($y_offset) {
-                // Move our children
-                foreach ($this->get_line_boxes() as $line) {
-                    foreach ($line->get_frames() as $frame) {
-                        $frame->move(0, $y_offset);
-                    }
-                }
-            }
+        // Determine our height
+        $style_height = (float)$style->length_in_pt($style->height, $h);
+
+        /** @var FrameDecorator\TableCell */
+        $frame = $this->_frame;
+
+        $frame->set_content_height($this->_calculate_content_height());
+
+        $height = max($style_height, (float)$frame->get_content_height());
+
+        // Let the cellmap know our height
+        $cell_height = $height / count($cells["rows"]);
+
+        if ($style_height <= $height) {
+            $cell_height += $top_space + $bottom_space;
+        }
+
+        foreach ($cells["rows"] as $i) {
+            $cellmap->set_row_height($i, $cell_height);
+        }
+
+        $style->set_used("height", $height);
+
+        $this->_text_align();
+        $this->vertical_align();
+
+        // Handle relative positioning
+        foreach ($this->_frame->get_children() as $child) {
+            $this->position_relative($child);
         }
     }
 
-    /**
-     * @param $side
-     * @param $border_spec
-     */
-    function set_resolved_border($side, $border_spec)
+    public function get_min_max_content_width(): array
     {
-        $this->_resolved_borders[$side] = $border_spec;
-    }
+        // Ignore percentage values for a specified width here, as they are
+        // relative to the table width, which is not determined yet
+        $style = $this->_frame->get_style();
+        $width = $style->width;
+        $fixed_width = $width !== "auto" && !Helpers::is_percent($width);
 
-    /**
-     * @param $side
-     * @return mixed
-     */
-    function get_resolved_border($side)
-    {
-        return $this->_resolved_borders[$side];
-    }
+        [$min, $max] = $this->get_min_max_child_width();
 
-    /**
-     * @return array
-     */
-    function get_resolved_borders()
-    {
-        return $this->_resolved_borders;
+        // For table cells: Use specified width if it is greater than the
+        // minimum defined by the content
+        if ($fixed_width) {
+            $width = (float) $style->length_in_pt($width, 0);
+            $min = max($width, $min);
+            $max = $min;
+        }
+
+        // Handle min/max width style properties
+        $min_width = $this->resolve_min_width(null);
+        $max_width = $this->resolve_max_width(null);
+        $min = Helpers::clamp($min, $min_width, $max_width);
+        $max = Helpers::clamp($max, $min_width, $max_width);
+
+        return [$min, $max];
     }
 }

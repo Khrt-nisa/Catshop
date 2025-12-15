@@ -4,118 +4,185 @@
  * @link    https://github.com/dompdf/dompdf
  * @license http://www.gnu.org/copyleft/lesser.html GNU Lesser General Public License
  */
-namespace Dompdf\FrameDecorator;
+namespace Dompdf\FrameReflower;
 
-use Dompdf\Dompdf;
-use Dompdf\Frame;
-use Dompdf\Exception;
+use Dompdf\FrameDecorator\Block as BlockFrameDecorator;
+use Dompdf\FrameDecorator\Inline as InlineFrameDecorator;
+use Dompdf\FrameDecorator\Text as TextFrameDecorator;
 
 /**
- * Decorates frames for inline layout
+ * Reflows inline frames
  *
  * @package dompdf
  */
-class Inline extends AbstractFrameDecorator
+class Inline extends AbstractFrameReflower
 {
-
     /**
      * Inline constructor.
-     * @param Frame $frame
-     * @param Dompdf $dompdf
+     * @param InlineFrameDecorator $frame
      */
-    function __construct(Frame $frame, Dompdf $dompdf)
+    function __construct(InlineFrameDecorator $frame)
     {
-        parent::__construct($frame, $dompdf);
+        parent::__construct($frame);
     }
 
     /**
-     * Vertical padding, border, and margin do not apply when determining the
-     * height for inline frames.
+     * Handle reflow of empty inline frames.
      *
-     * http://www.w3.org/TR/CSS21/visudet.html#inline-non-replaced
+     * Regular inline frames are positioned together with their text (or inline)
+     * children after child reflow. Empty inline frames have no children that
+     * could determine the positioning, so they need to be handled separately.
      *
-     * The vertical padding, border and margin of an inline, non-replaced box
-     * start at the top and bottom of the content area, not the
-     * 'line-height'. But only the 'line-height' is used to calculate the
-     * height of the line box.
-     *
-     * @return float
+     * @param BlockFrameDecorator $block
      */
-    public function get_margin_height(): float
+    protected function reflow_empty(BlockFrameDecorator $block): void
     {
-        $style = $this->get_style();
-        $font = $style->font_family;
-        $size = $style->font_size;
-        $fontHeight = $this->_dompdf->getFontMetrics()->getFontHeight($font, $size);
+        /** @var InlineFrameDecorator */
+        $frame = $this->_frame;
+        $style = $frame->get_style();
 
-        return ($style->line_height / ($size > 0 ? $size : 1)) * $fontHeight;
+        // Resolve width, so the margin width can be checked
+        $style->set_used("width", 0.0);
+
+        $cb = $frame->get_containing_block();
+        $line = $block->get_current_line_box();
+        $width = $frame->get_margin_width();
+
+        if ($width > ($cb["w"] - $line->left - $line->w - $line->right)) {
+            $block->add_line();
+
+            // Find the appropriate inline ancestor to split
+            $child = $frame;
+            $p = $child->get_parent();
+            while ($p instanceof InlineFrameDecorator && !$child->get_prev_sibling()) {
+                $child = $p;
+                $p = $p->get_parent();
+            }
+
+            if ($p instanceof InlineFrameDecorator) {
+                // Split parent and stop current reflow. Reflow continues
+                // via child-reflow loop of split parent
+                $p->split($child);
+                return;
+            }
+        }
+
+        $frame->position();
+        $block->add_frame_to_line($frame);
     }
 
-    public function split(?Frame $child = null, bool $page_break = false, bool $forced = false): void
+    /**
+     * @param BlockFrameDecorator|null $block
+     */
+    function reflow(BlockFrameDecorator $block = null)
     {
-        if (is_null($child)) {
-            $this->get_parent()->split($this, $page_break, $forced);
+        /** @var InlineFrameDecorator */
+        $frame = $this->_frame;
+
+        // Check if a page break is forced
+        $page = $frame->get_root();
+        $page->check_forced_page_break($frame);
+
+        if ($page->is_full()) {
             return;
         }
 
-        if ($child->get_parent() !== $this) {
-            throw new Exception("Unable to split: frame is not a child of this one.");
+        // Counters and generated content
+        $this->_set_content();
+
+        $style = $frame->get_style();
+
+        // Resolve auto margins
+        // https://www.w3.org/TR/CSS21/visudet.html#inline-width
+        // https://www.w3.org/TR/CSS21/visudet.html#inline-non-replaced
+        if ($style->margin_left === "auto") {
+            $style->set_used("margin_left", 0.0);
+        }
+        if ($style->margin_right === "auto") {
+            $style->set_used("margin_right", 0.0);
+        }
+        if ($style->margin_top === "auto") {
+            $style->set_used("margin_top", 0.0);
+        }
+        if ($style->margin_bottom === "auto") {
+            $style->set_used("margin_bottom", 0.0);
         }
 
-        $this->revert_counter_increment();
-        $node = $this->_frame->get_node();
-        $split = $this->copy($node->cloneNode());
+        // Handle line breaks
+        if ($frame->get_node()->nodeName === "br") {
+            if ($block) {
+                $line = $block->get_current_line_box();
+                $frame->set_containing_line($line);
+                $block->maximize_line_height($frame->get_margin_height(), $frame);
+                $block->add_line(true);
 
-        $style = $this->_frame->get_style();
-        $split_style = $split->get_style();
+                $next = $frame->get_next_sibling();
+                $p = $frame->get_parent();
 
-        // Unset the current node's right style properties
-        $style->margin_right = 0.0;
-        $style->padding_right = 0.0;
-        $style->border_right_width = 0.0;
-        $style->border_top_right_radius = 0.0;
-        $style->border_bottom_right_radius = 0.0;
-
-        // Unset the split node's left style properties since we don't want them
-        // to propagate
-        $split_style->margin_left = 0.0;
-        $split_style->padding_left = 0.0;
-        $split_style->border_left_width = 0.0;
-        $split_style->border_top_left_radius = 0.0;
-        $split_style->border_bottom_left_radius = 0.0;
-
-        // If this is a generated node don't propagate the content style
-        if ($split->get_node()->nodeName == "dompdf_generated") {
-            $split_style->content = "normal";
+                if ($next && $p instanceof InlineFrameDecorator) {
+                    $p->split($next);
+                }
+            }
+            return;
         }
 
-        //On continuation of inline element on next line,
-        //don't repeat non-horizontally repeatable background images
-        //See e.g. in testcase image_variants, long descriptions
-        if (($url = $style->background_image) && $url !== "none"
-            && ($repeat = $style->background_repeat) && $repeat !== "repeat" && $repeat !== "repeat-x"
-        ) {
-            $split_style->background_image = "none";
+        // Handle empty inline frames
+        if (!$frame->get_first_child()) {
+            if ($block) {
+                $this->reflow_empty($block);
+            }
+            return;
         }
 
-        $this->get_parent()->insert_child_after($split, $this);
-
-        // Add $child and all following siblings to the new split node
-        $iter = $child;
-        while ($iter) {
-            $frame = $iter;
-            $iter = $iter->get_next_sibling();
-            $frame->reset();
-            $split->append_child($frame);
+        // Add our margin, padding & border to the first and last children
+        if (($f = $frame->get_first_child()) && $f instanceof TextFrameDecorator) {
+            $f_style = $f->get_style();
+            $f_style->margin_left = $style->margin_left;
+            $f_style->padding_left = $style->padding_left;
+            $f_style->border_left_width = $style->border_left_width;
+            $f_style->border_left_style = $style->border_left_style;
+            $f_style->border_left_color = $style->border_left_color;
         }
 
-        $parent = $this->get_parent();
+        if (($l = $frame->get_last_child()) && $l instanceof TextFrameDecorator) {
+            $l_style = $l->get_style();
+            $l_style->margin_right = $style->margin_right;
+            $l_style->padding_right = $style->padding_right;
+            $l_style->border_right_width = $style->border_right_width;
+            $l_style->border_right_style = $style->border_right_style;
+            $l_style->border_right_color = $style->border_right_color;
+        }
 
-        if ($page_break) {
-            $parent->split($split, $page_break, $forced);
-        } elseif ($parent instanceof Inline) {
-            $parent->split($split);
+        $cb = $frame->get_containing_block();
+
+        // Set the containing blocks and reflow each child.  The containing
+        // block is not changed by line boxes.
+        foreach ($frame->get_children() as $child) {
+            $child->set_containing_block($cb);
+            $child->reflow($block);
+
+            // Stop reflow if the frame has been reset by a line or page break
+            // due to child reflow
+            if (!$frame->content_set) {
+                return;
+            }
+        }
+
+        if (!$frame->get_first_child()) {
+            return;
+        }
+
+        // Assume the position of the first child
+        [$x, $y] = $frame->get_first_child()->get_position();
+        $frame->set_position($x, $y);
+
+        // Handle relative positioning
+        foreach ($frame->get_children() as $child) {
+            $this->position_relative($child);
+        }
+
+        if ($block) {
+            $block->add_frame_to_line($frame);
         }
     }
-
 }

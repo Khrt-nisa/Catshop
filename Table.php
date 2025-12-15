@@ -4,340 +4,520 @@
  * @link    https://github.com/dompdf/dompdf
  * @license http://www.gnu.org/copyleft/lesser.html GNU Lesser General Public License
  */
-namespace Dompdf\FrameDecorator;
+namespace Dompdf\FrameReflower;
 
-use Dompdf\Cellmap;
-use DOMNode;
-use Dompdf\Css\Style;
-use Dompdf\Dompdf;
-use Dompdf\Frame;
+use Dompdf\FrameDecorator\Block as BlockFrameDecorator;
+use Dompdf\FrameDecorator\Table as TableFrameDecorator;
+use Dompdf\Helpers;
 
 /**
- * Decorates Frames for table layout
+ * Reflows tables
  *
  * @package dompdf
  */
-class Table extends AbstractFrameDecorator
+class Table extends AbstractFrameReflower
 {
-    public const VALID_CHILDREN = Style::TABLE_INTERNAL_TYPES;
-
     /**
-     * List of all row-group display types.
-     */
-    public const ROW_GROUPS = [
-        "table-row-group",
-        "table-header-group",
-        "table-footer-group"
-    ];
-
-    /**
-     * The Cellmap object for this table.  The cellmap maps table cells
-     * to rows and columns, and aids in calculating column widths.
+     * Frame for this reflower
      *
-     * @var Cellmap
+     * @var TableFrameDecorator
      */
-    protected $_cellmap;
+    protected $_frame;
 
     /**
-     * Table header rows.  Each table header is duplicated when a table
-     * spans pages.
+     * Cache of results between call to get_min_max_width and assign_widths
      *
-     * @var TableRowGroup[]
+     * @var array
      */
-    protected $_headers;
+    protected $_state;
 
     /**
-     * Table footer rows.  Each table footer is duplicated when a table
-     * spans pages.
-     *
-     * @var TableRowGroup[]
+     * Table constructor.
+     * @param TableFrameDecorator $frame
      */
-    protected $_footers;
-
-    /**
-     * Class constructor
-     *
-     * @param Frame $frame the frame to decorate
-     * @param Dompdf $dompdf
-     */
-    public function __construct(Frame $frame, Dompdf $dompdf)
+    function __construct(TableFrameDecorator $frame)
     {
-        parent::__construct($frame, $dompdf);
-        $this->_cellmap = new Cellmap($this);
-
-        if ($frame->get_style()->table_layout === "fixed") {
-            $this->_cellmap->set_layout_fixed(true);
-        }
-
-        $this->_headers = [];
-        $this->_footers = [];
+        $this->_state = null;
+        parent::__construct($frame);
     }
 
-    public function reset()
+    /**
+     * State is held here so it needs to be reset along with the decorator
+     */
+    public function reset(): void
     {
         parent::reset();
-        $this->_cellmap->reset();
-        $this->_headers = [];
-        $this->_footers = [];
-        $this->_reflower->reset();
+        $this->_state = null;
     }
 
-    //........................................................................
-
-    /**
-     * Split the table at $row.  $row and all subsequent rows will be
-     * added to the clone.  This method is overridden in order to remove
-     * frames from the cellmap properly.
-     */
-    public function split(?Frame $child = null, bool $page_break = false, bool $forced = false): void
+    protected function _assign_widths()
     {
-        if (is_null($child)) {
-            parent::split($child, $page_break, $forced);
+        $style = $this->_frame->get_style();
+
+        // Find the min/max width of the table and sort the columns into
+        // absolute/percent/auto arrays
+        $delta = $this->_state["width_delta"];
+        $min_width = $this->_state["min_width"];
+        $max_width = $this->_state["max_width"];
+        $percent_used = $this->_state["percent_used"];
+        $absolute_used = $this->_state["absolute_used"];
+        $auto_min = $this->_state["auto_min"];
+
+        $absolute =& $this->_state["absolute"];
+        $percent =& $this->_state["percent"];
+        $auto =& $this->_state["auto"];
+
+        // Determine the actual width of the table (excluding borders and
+        // padding)
+        $cb = $this->_frame->get_containing_block();
+        $columns =& $this->_frame->get_cellmap()->get_columns();
+
+        $width = $style->width;
+        $min_table_width = $this->resolve_min_width($cb["w"]) - $delta;
+
+        if ($width !== "auto") {
+            $preferred_width = (float) $style->length_in_pt($width, $cb["w"]) - $delta;
+
+            if ($preferred_width < $min_table_width) {
+                $preferred_width = $min_table_width;
+            }
+
+            if ($preferred_width > $min_width) {
+                $width = $preferred_width;
+            } else {
+                $width = $min_width;
+            }
+
+        } else {
+            if ($max_width + $delta < $cb["w"]) {
+                $width = $max_width;
+            } elseif ($cb["w"] - $delta > $min_width) {
+                $width = $cb["w"] - $delta;
+            } else {
+                $width = $min_width;
+            }
+
+            if ($width < $min_table_width) {
+                $width = $min_table_width;
+            }
+
+        }
+
+        // Store our resolved width
+        $style->set_used("width", $width);
+
+        $cellmap = $this->_frame->get_cellmap();
+
+        if ($cellmap->is_columns_locked()) {
             return;
         }
 
-        // If $child is a header or if it is the first non-header row, do
-        // not duplicate headers, simply move the table to the next page.
-        if (count($this->_headers)
-            && !in_array($child, $this->_headers, true)
-            && !in_array($child->get_prev_sibling(), $this->_headers, true)
-        ) {
-            $first_header = null;
-
-            // Insert copies of the table headers before $child
-            foreach ($this->_headers as $header) {
-
-                $new_header = $header->deep_copy();
-
-                if (is_null($first_header)) {
-                    $first_header = $new_header;
-                }
-
-                $this->insert_child_before($new_header, $child);
+        // If the whole table fits on the page, then assign each column it's max width
+        if ($width == $max_width) {
+            foreach ($columns as $i => $col) {
+                $cellmap->set_column_width($i, $col["max-width"]);
             }
 
-            parent::split($first_header, $page_break, $forced);
+            return;
+        }
 
-        } elseif (in_array($child->get_style()->display, self::ROW_GROUPS, true)) {
+        // Determine leftover and assign it evenly to all columns
+        if ($width > $min_width) {
+            // We have three cases to deal with:
+            //
+            // 1. All columns are auto or absolute width.  In this case we
+            // distribute extra space across all auto columns weighted by the
+            // difference between their max and min width, or by max width only
+            // if the width of the table is larger than the max width for all
+            // columns.
+            //
+            // 2. Only absolute widths have been specified, no auto columns.  In
+            // this case we distribute extra space across all columns weighted
+            // by their absolute width.
+            //
+            // 3. Percentage widths have been specified.  In this case we normalize
+            // the percentage values and try to assign widths as fractions of
+            // the table width. Absolute column widths are fully satisfied and
+            // any remaining space is evenly distributed among all auto columns.
 
-            // Individual rows should have already been handled
-            parent::split($child, $page_break, $forced);
+            // Case 1:
+            if ($percent_used == 0 && count($auto)) {
+                foreach ($absolute as $i) {
+                    $w = $columns[$i]["min-width"];
+                    $cellmap->set_column_width($i, $w);
+                }
 
+                if ($width < $max_width) {
+                    $increment = $width - $min_width;
+                    $table_delta = $max_width - $min_width;
+
+                    foreach ($auto as $i) {
+                        $min = $columns[$i]["min-width"];
+                        $max = $columns[$i]["max-width"];
+                        $col_delta = $max - $min;
+                        $w = $min + $increment * ($col_delta / $table_delta);
+                        $cellmap->set_column_width($i, $w);
+                    }
+                } else {
+                    $increment = $width - $max_width;
+                    $auto_max = $max_width - $absolute_used;
+
+                    foreach ($auto as $i) {
+                        $max = $columns[$i]["max-width"];
+                        $f = $auto_max > 0 ? $max / $auto_max : 1 / count($auto);
+                        $w = $max + $increment * $f;
+                        $cellmap->set_column_width($i, $w);
+                    }
+                }
+                return;
+            }
+
+            // Case 2:
+            if ($percent_used == 0 && !count($auto)) {
+                $increment = $width - $absolute_used;
+
+                foreach ($absolute as $i) {
+                    $abs = $columns[$i]["min-width"];
+                    $f = $absolute_used > 0 ? $abs / $absolute_used : 1 / count($absolute);
+                    $w = $abs + $increment * $f;
+                    $cellmap->set_column_width($i, $w);
+                }
+                return;
+            }
+
+            // Case 3:
+            if ($percent_used > 0) {
+                // Scale percent values if the total percentage is > 100 or
+                // there are no auto values to take up slack
+                if ($percent_used > 100 || count($auto) == 0) {
+                    $scale = 100 / $percent_used;
+                } else {
+                    $scale = 1;
+                }
+
+                // Account for the minimum space used by the unassigned auto
+                // columns, by the columns with absolute widths, and the
+                // percentage columns following the current one
+                $used_width = $auto_min + $absolute_used;
+
+                foreach ($absolute as $i) {
+                    $w = $columns[$i]["min-width"];
+                    $cellmap->set_column_width($i, $w);
+                }
+
+                $percent_min = 0;
+
+                foreach ($percent as $i) {
+                    $percent_min += $columns[$i]["min-width"];
+                }
+
+                // First-come, first served
+                foreach ($percent as $i) {
+                    $min = $columns[$i]["min-width"];
+                    $percent_min -= $min;
+                    $slack = $width - $used_width - $percent_min;
+
+                    $columns[$i]["percent"] *= $scale;
+                    $w = min($columns[$i]["percent"] * $width / 100, $slack);
+
+                    if ($w < $min) {
+                        $w = $min;
+                    }
+
+                    $cellmap->set_column_width($i, $w);
+                    $used_width += $w;
+                }
+
+                // This works because $used_width includes the min-width of each
+                // unassigned column
+                if (count($auto) > 0) {
+                    $increment = ($width - $used_width) / count($auto);
+
+                    foreach ($auto as $i) {
+                        $w = $columns[$i]["min-width"] + $increment;
+                        $cellmap->set_column_width($i, $w);
+                    }
+                }
+                return;
+            }
         } else {
-
-            $iter = $child;
-
-            while ($iter) {
-                $this->_cellmap->remove_row($iter);
-                $iter = $iter->get_next_sibling();
+            // We are over-constrained:
+            // Each column gets its minimum width
+            foreach ($columns as $i => $col) {
+                $cellmap->set_column_width($i, $col["min-width"]);
             }
-
-            parent::split($child, $page_break, $forced);
         }
-    }
-
-    public function copy(DOMNode $node)
-    {
-        $deco = parent::copy($node);
-
-        // In order to keep columns' widths through pages
-        $deco->_cellmap->set_columns($this->_cellmap->get_columns());
-        $deco->_cellmap->lock_columns();
-
-        return $deco;
     }
 
     /**
-     * Static function to locate the parent table of a frame
+     * Determine the frame's height based on min/max height
      *
-     * @param Frame $frame
-     *
-     * @return Table the table that is an ancestor of $frame
+     * @return float
      */
-    public static function find_parent_table(Frame $frame)
+    protected function _calculate_height()
     {
-        while ($frame = $frame->get_parent()) {
-            if ($frame->is_table()) {
-                break;
-            }
+        $frame = $this->_frame;
+        $style = $frame->get_style();
+        $cb = $frame->get_containing_block();
+
+        $height = $style->length_in_pt($style->height, $cb["h"]);
+
+        $cellmap = $frame->get_cellmap();
+        $cellmap->assign_frame_heights();
+        $rows = $cellmap->get_rows();
+
+        // Determine our content height
+        $content_height = 0.0;
+        foreach ($rows as $r) {
+            $content_height += $r["height"];
         }
 
-        return $frame;
+        if ($height === "auto") {
+            $height = $content_height;
+        }
+
+        // Handle min/max height
+        // https://www.w3.org/TR/CSS21/visudet.html#min-max-heights
+        $min_height = $this->resolve_min_height($cb["h"]);
+        $max_height = $this->resolve_max_height($cb["h"]);
+        $height = Helpers::clamp($height, $min_height, $max_height);
+
+        // Use the content height or the height value, whichever is greater
+        if ($height <= $content_height) {
+            $height = $content_height;
+        } else {
+            // FIXME: Borders and row positions are not properly updated by this
+            // $cellmap->set_frame_heights($height, $content_height);
+        }
+
+        return $height;
     }
 
     /**
-     * Return this table's Cellmap
-     *
-     * @return Cellmap
+     * @param BlockFrameDecorator|null $block
      */
-    public function get_cellmap()
+    function reflow(BlockFrameDecorator $block = null)
     {
-        return $this->_cellmap;
-    }
+        /** @var TableFrameDecorator */
+        $frame = $this->_frame;
 
-    //........................................................................
+        // Check if a page break is forced
+        $page = $frame->get_root();
+        $page->check_forced_page_break($frame);
 
-    /**
-     * Check for text nodes between valid table children that only contain white
-     * space, except if white space is to be preserved.
-     *
-     * @param AbstractFrameDecorator $frame
-     *
-     * @return bool
-     */
-    private function isEmptyTextNode(AbstractFrameDecorator $frame): bool
-    {
-        // This is based on the white-space pattern in `FrameReflower\Text`,
-        // i.e. only match on collapsible white space
-        $wsPattern = '/^[^\S\xA0\x{202F}\x{2007}]*$/u';
-        $validChildOrNull = function ($frame) {
-            return $frame === null
-                || in_array($frame->get_style()->display, self::VALID_CHILDREN, true);
-        };
-
-        return $frame instanceof Text
-            && !$frame->is_pre()
-            && preg_match($wsPattern, $frame->get_text())
-            && $validChildOrNull($frame->get_prev_sibling())
-            && $validChildOrNull($frame->get_next_sibling());
-    }
-
-    /**
-     * Restructure tree so that the table has the correct structure. Misplaced
-     * children are appropriately wrapped in anonymous row groups, rows, and
-     * cells.
-     *
-     * https://www.w3.org/TR/CSS21/tables.html#anonymous-boxes
-     */
-    public function normalize(): void
-    {
-        $column_caption = ["table-column-group", "table-column", "table-caption"];
-        $children = iterator_to_array($this->get_children());
-        $tbody = null;
-
-        foreach ($children as $child) {
-            $display = $child->get_style()->display;
-
-            if (in_array($display, self::ROW_GROUPS, true)) {
-                // Reset anonymous tbody
-                $tbody = null;
-
-                // Add headers and footers
-                if ($display === "table-header-group") {
-                    $this->_headers[] = $child;
-                } elseif ($display === "table-footer-group") {
-                    $this->_footers[] = $child;
-                }
-                continue;
-            }
-
-            if (in_array($display, $column_caption, true)) {
-                continue;
-            }
-
-            // Remove empty text nodes between valid children
-            if ($this->isEmptyTextNode($child)) {
-                $this->remove_child($child);
-                continue;
-            }
-
-            // Catch consecutive misplaced frames within a single anonymous group
-            if ($tbody === null) {
-                $tbody = $this->create_anonymous_child("tbody", "table-row-group");
-                $this->insert_child_before($tbody, $child);
-            }
-
-            $tbody->append_child($child);
+        // Bail if the page is full
+        if ($page->is_full()) {
+            return;
         }
 
-        // Handle empty table: Make sure there is at least one row group
-        if (!$this->get_first_child()) {
-            $tbody = $this->create_anonymous_child("tbody", "table-row-group");
-            $this->append_child($tbody);
+        // Let the page know that we're reflowing a table so that splits
+        // are suppressed (simply setting page-break-inside: avoid won't
+        // work because we may have an arbitrary number of block elements
+        // inside tds.)
+        $page->table_reflow_start();
+
+        $this->determine_absolute_containing_block();
+
+        // Counters and generated content
+        $this->_set_content();
+
+        // Collapse vertical margins, if required
+        $this->_collapse_margins();
+
+        // Table layout algorithm:
+        // http://www.w3.org/TR/CSS21/tables.html#auto-table-layout
+
+        if (is_null($this->_state)) {
+            $this->get_min_max_width();
         }
 
-        foreach ($this->get_children() as $child) {
-            $display = $child->get_style()->display;
+        $cb = $frame->get_containing_block();
+        $style = $frame->get_style();
 
-            if (in_array($display, self::ROW_GROUPS, true)) {
-                $this->normalizeRowGroup($child);
-            }
-        }
-    }
+        // This is slightly inexact, but should be okay.  Add half the
+        // border-spacing to the table as padding.  The other half is added to
+        // the cells themselves.
+        if ($style->border_collapse === "separate") {
+            [$h, $v] = $style->border_spacing;
+            $v = $v / 2;
+            $h = $h / 2;
 
-    private function normalizeRowGroup(AbstractFrameDecorator $frame): void
-    {
-        $children = iterator_to_array($frame->get_children());
-        $tr = null;
-
-        foreach ($children as $child) {
-            $display = $child->get_style()->display;
-
-            if ($display === "table-row") {
-                // Reset anonymous tr
-                $tr = null;
-                continue;
-            }
-
-            // Remove empty text nodes between valid children
-            if ($this->isEmptyTextNode($child)) {
-                $frame->remove_child($child);
-                continue;
-            }
-
-            // Catch consecutive misplaced frames within a single anonymous row
-            if ($tr === null) {
-                $tr = $frame->create_anonymous_child("tr", "table-row");
-                $frame->insert_child_before($tr, $child);
-            }
-
-            $tr->append_child($child);
+            $style->set_used("padding_left", (float)$style->length_in_pt($style->padding_left, $cb["w"]) + $h);
+            $style->set_used("padding_right", (float)$style->length_in_pt($style->padding_right, $cb["w"]) + $h);
+            $style->set_used("padding_top", (float)$style->length_in_pt($style->padding_top, $cb["w"]) + $v);
+            $style->set_used("padding_bottom", (float)$style->length_in_pt($style->padding_bottom, $cb["w"]) + $v);
         }
 
-        // Handle empty row group: Make sure there is at least one row
-        if (!$frame->get_first_child()) {
-            $tr = $frame->create_anonymous_child("tr", "table-row");
-            $frame->append_child($tr);
+        $this->_assign_widths();
+
+        // Adjust left & right margins, if they are auto
+        $delta = $this->_state["width_delta"];
+        $width = $style->width;
+        $left = $style->length_in_pt($style->margin_left, $cb["w"]);
+        $right = $style->length_in_pt($style->margin_right, $cb["w"]);
+
+        $diff = (float) $cb["w"] - (float) $width - $delta;
+
+        if ($left === "auto" && $right === "auto") {
+            if ($diff < 0) {
+                $left = 0;
+                $right = $diff;
+            } else {
+                $left = $right = $diff / 2;
+            }
+        } else {
+            if ($left === "auto") {
+                $left = max($diff - $right, 0);
+            }
+            if ($right === "auto") {
+                $right = max($diff - $left, 0);
+            }
         }
 
+        $style->set_used("margin_left", $left);
+        $style->set_used("margin_right", $right);
+
+        $frame->position();
+        [$x, $y] = $frame->get_position();
+
+        // Determine the content edge
+        $offset_x = (float)$left + (float)$style->length_in_pt([
+            $style->padding_left,
+            $style->border_left_width
+        ], $cb["w"]);
+        $offset_y = (float)$style->length_in_pt([
+            $style->margin_top,
+            $style->border_top_width,
+            $style->padding_top
+        ], $cb["w"]);
+        $content_x = $x + $offset_x;
+        $content_y = $y + $offset_y;
+
+        if (isset($cb["h"])) {
+            $h = $cb["h"];
+        } else {
+            $h = null;
+        }
+
+        $cellmap = $frame->get_cellmap();
+        $col =& $cellmap->get_column(0);
+        $col["x"] = $offset_x;
+
+        $row =& $cellmap->get_row(0);
+        $row["y"] = $offset_y;
+
+        $cellmap->assign_x_positions();
+
+        // Set the containing block of each child & reflow
         foreach ($frame->get_children() as $child) {
-            $this->normalizeRow($child);
+            $child->set_containing_block($content_x, $content_y, $width, $h);
+            $child->reflow();
+
+            if (!$page->in_nested_table()) {
+                // Check if a split has occurred
+                $page->check_page_break($child);
+    
+                if ($page->is_full()) {
+                    break;
+                }
+            }
+        }
+
+        // Stop reflow if a page break has occurred before the frame, in which
+        // case it has been reset, including its position
+        if ($page->is_full() && $frame->get_position("x") === null) {
+            $page->table_reflow_end();
+            return;
+        }
+
+        // Assign heights to our cells:
+        $style->set_used("height", $this->_calculate_height());
+
+        $page->table_reflow_end();
+
+        if ($block && $frame->is_in_flow()) {
+            $block->add_frame_to_line($frame);
+
+            if ($frame->is_block_level()) {
+                $block->add_line();
+            }
         }
     }
 
-    private function normalizeRow(AbstractFrameDecorator $frame): void
+    public function get_min_max_width(): array
     {
-        $children = iterator_to_array($frame->get_children());
-        $td = null;
-
-        foreach ($children as $child) {
-            $display = $child->get_style()->display;
-
-            if ($display === "table-cell") {
-                // Reset anonymous td
-                $td = null;
-                continue;
-            }
-
-            // Remove empty text nodes between valid children
-            if ($this->isEmptyTextNode($child)) {
-                $frame->remove_child($child);
-                continue;
-            }
-
-            // Catch consecutive misplaced frames within a single anonymous cell
-            if ($td === null) {
-                $td = $frame->create_anonymous_child("td", "table-cell");
-                $frame->insert_child_before($td, $child);
-            }
-
-            $td->append_child($child);
+        if (!is_null($this->_min_max_cache)) {
+            return $this->_min_max_cache;
         }
 
-        // Handle empty row: Make sure there is at least one cell
-        if (!$frame->get_first_child()) {
-            $td = $frame->create_anonymous_child("td", "table-cell");
-            $frame->append_child($td);
+        $style = $this->_frame->get_style();
+        $cellmap = $this->_frame->get_cellmap();
+
+        $this->_frame->normalize();
+
+        // Add the cells to the cellmap (this will calculate column widths as
+        // frames are added)
+        $cellmap->add_frame($this->_frame);
+
+        // Find the min/max width of the table and sort the columns into
+        // absolute/percent/auto arrays
+        $this->_state = [];
+        $this->_state["min_width"] = 0;
+        $this->_state["max_width"] = 0;
+
+        $this->_state["percent_used"] = 0;
+        $this->_state["absolute_used"] = 0;
+        $this->_state["auto_min"] = 0;
+
+        $this->_state["absolute"] = [];
+        $this->_state["percent"] = [];
+        $this->_state["auto"] = [];
+
+        $columns =& $cellmap->get_columns();
+        foreach ($columns as $i => $col) {
+            $this->_state["min_width"] += $col["min-width"];
+            $this->_state["max_width"] += $col["max-width"];
+
+            if ($col["absolute"] > 0) {
+                $this->_state["absolute"][] = $i;
+                $this->_state["absolute_used"] += $col["min-width"];
+            } elseif ($col["percent"] > 0) {
+                $this->_state["percent"][] = $i;
+                $this->_state["percent_used"] += $col["percent"];
+            } else {
+                $this->_state["auto"][] = $i;
+                $this->_state["auto_min"] += $col["min-width"];
+            }
         }
+
+        // Account for margins, borders, padding, and border spacing
+        $cb_w = $this->_frame->get_containing_block("w");
+        $lm = (float) $style->length_in_pt($style->margin_left, $cb_w);
+        $rm = (float) $style->length_in_pt($style->margin_right, $cb_w);
+
+        $dims = [
+            $style->border_left_width,
+            $style->border_right_width,
+            $style->padding_left,
+            $style->padding_right
+        ];
+
+        if ($style->border_collapse !== "collapse") {
+            list($dims[]) = $style->border_spacing;
+        }
+
+        $delta = (float) $style->length_in_pt($dims, $cb_w);
+
+        $this->_state["width_delta"] = $delta;
+
+        $min_width = $this->_state["min_width"] + $delta + $lm + $rm;
+        $max_width = $this->_state["max_width"] + $delta + $lm + $rm;
+
+        return $this->_min_max_cache = [
+            $min_width,
+            $max_width,
+            "min" => $min_width,
+            "max" => $max_width
+        ];
     }
 }
